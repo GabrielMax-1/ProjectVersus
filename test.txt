@@ -1,0 +1,1095 @@
+# FeatureMetadataManager.gd
+extends Node
+
+# ==================== CONSTANTES ====================
+const METADATA_FILE_PATH = "user://feature_metadata.json"
+const CHUNK_SIZE = 1024
+const USAGE_STALE_THRESHOLD = 90000  # 25 horas sin uso
+const DOWNLOAD_STALE_THRESHOLD = 180000  # 50 horas desde descarga
+
+# ==================== ENUMS ====================
+enum FeatureState {
+	# Base states (🟢)
+	UNLISTED,
+	LISTED,
+	
+	# Download states (🟡)
+	NOT_DOWNLOADED,
+	FIRST_DOWNLOAD_FAILED,
+	UPDATE_DOWNLOAD_FAILED,
+	DOWNLOADED,
+	
+	# Check states (🔵)
+	CHECK_FAILED,
+	VERSION_UNKNOWN,
+	UP_TO_DATE_UNFETCHED,
+	UP_TO_DATE,
+	OUTDATED,
+	
+	# Validation states (🔴)
+	INVALID,
+	CORRUPTED,
+	STABLE,
+	
+	# Runtime states (🟣)
+	LOADED,
+	RUNNING,
+	UNLOADED,
+	
+	# Cleanup states (🟤)
+	NEVER_USED,
+	DOWNLOAD_STALE,
+	USAGE_STALE,
+	SAFE
+}
+
+# ==================== VARIABLES ====================
+var features: Dictionary = {}
+var loaded_features: Dictionary = {}  # feature_id -> Resource
+var running_features: Array = []  # feature_ids en ejecución
+var _downloading_features: Dictionary = {}  # feature_id -> {progress, callback, started_at}
+
+# ==================== INICIALIZACIÓN ====================
+func _ready():
+	load_metadata()
+
+# ==================== GESTIÓN DE ARCHIVO ====================
+func load_metadata() -> bool:
+	if not FileAccess.file_exists(METADATA_FILE_PATH):
+		features = {}
+		return false
+	
+	var file = FileAccess.open(METADATA_FILE_PATH, FileAccess.READ)
+	if file == null:
+		push_error("No se pudo abrir el archivo de metadatos")
+		return false
+	
+	var json_string = file.get_as_text()
+	file.close()
+	
+	var json = JSON.new()
+	var parse_result = json.parse(json_string)
+	
+	if parse_result != OK:
+		push_error("Error al parsear JSON: " + json.get_error_message())
+		return false
+	
+	features = json.data
+	return true
+
+func save_metadata() -> bool:
+	var file = FileAccess.open(METADATA_FILE_PATH, FileAccess.WRITE)
+	if file == null:
+		push_error("No se pudo crear/abrir el archivo para escritura")
+		return false
+	
+	var json_string = JSON.stringify(features, "\t")
+	file.store_string(json_string)
+	file.close()
+	return true
+
+func reset_all_metadata() -> void:
+	features.clear()
+	save_metadata()
+
+# ==================== CREAR FEATURES ====================
+func create_feature(feature_id: String, feature_data: Dictionary) -> bool:
+	if features.has(feature_id):
+		push_warning("El feature '%s' ya existe" % feature_id)
+		return false
+	
+	features[feature_id] = feature_data
+	return save_metadata()
+
+func create_feature_from_json(feature_id: String, json_string: String) -> bool:
+	var json = JSON.new()
+	var parse_result = json.parse(json_string)
+	
+	if parse_result != OK:
+		push_error("Error al parsear JSON: " + json.get_error_message())
+		return false
+	
+	return create_feature(feature_id, json.data)
+
+func create_multiple_features(features_dict: Dictionary) -> bool:
+	for feature_id in features_dict.keys():
+		features[feature_id] = features_dict[feature_id]
+	return save_metadata()
+
+# ==================== OBTENER FEATURES ====================
+func has_feature(feature_id: String) -> bool:
+	return features.has(feature_id)
+
+func get_feature(feature_id: String) -> Dictionary:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return {}
+	return features[feature_id]
+
+func get_feature_as_json(feature_id: String) -> String:
+	if not features.has(feature_id):
+		return ""
+	return JSON.stringify(features[feature_id], "\t")
+
+func get_feature_property(feature_id: String, property: String) -> Variant:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return null
+	
+	if not features[feature_id].has(property):
+		push_warning("La propiedad '%s' no existe en '%s'" % [property, feature_id])
+		return null
+	
+	return features[feature_id][property]
+
+func get_all_features() -> Dictionary:
+	return features.duplicate(true)
+
+func get_all_features_as_json() -> String:
+	return JSON.stringify(features, "\t")
+
+func get_all_feature_ids() -> Array:
+	return features.keys()
+
+func get_feature_count() -> int:
+	return features.size()
+
+func has_any_features() -> bool:
+	return not features.is_empty()
+
+func get_features_by_condition(property: String, value: Variant) -> Array:
+	var result = []
+	for feature_id in features.keys():
+		if features[feature_id].has(property) and features[feature_id][property] == value:
+			result.append(feature_id)
+	return result
+
+# ==================== MODIFICAR FEATURES ====================
+func update_feature(feature_id: String, feature_data: Dictionary) -> bool:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return false
+	
+	features[feature_id] = feature_data
+	return save_metadata()
+
+func update_feature_property(feature_id: String, property: String, value: Variant) -> bool:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return false
+	
+	features[feature_id][property] = value
+	return save_metadata()
+
+func update_feature_properties(feature_id: String, properties: Dictionary) -> bool:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return false
+	
+	for property in properties.keys():
+		features[feature_id][property] = properties[property]
+	
+	return save_metadata()
+
+func update_property_in_multiple_features(feature_ids: Array, property: String, value: Variant) -> bool:
+	for feature_id in feature_ids:
+		if features.has(feature_id):
+			features[feature_id][property] = value
+	return save_metadata()
+
+func update_last_used(feature_id: String) -> bool:
+	return update_feature_property(feature_id, "last_used", Time.get_unix_time_from_system())
+
+# ==================== ELIMINAR FEATURES ====================
+func delete_feature(feature_id: String) -> bool:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return false
+	
+	features.erase(feature_id)
+	return save_metadata()
+
+func delete_multiple_features(feature_ids: Array) -> bool:
+	for feature_id in feature_ids:
+		features.erase(feature_id)
+	return save_metadata()
+
+func delete_feature_property(feature_id: String, property: String) -> bool:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return false
+	
+	if not features[feature_id].has(property):
+		push_warning("La propiedad '%s' no existe en '%s'" % [property, feature_id])
+		return false
+	
+	features[feature_id].erase(property)
+	return save_metadata()
+
+# ==================== VALIDACIÓN DE ARCHIVOS ====================
+func feature_file_exists(feature_id: String) -> bool:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return false
+	
+	var path = features[feature_id].get("path", "")
+	if path.is_empty():
+		push_warning("El feature '%s' no tiene una ruta definida" % feature_id)
+		return false
+	
+	return FileAccess.file_exists(path)
+
+func check_multiple_files_exist(feature_ids: Array) -> Dictionary:
+	var result = {}
+	for feature_id in feature_ids:
+		result[feature_id] = feature_file_exists(feature_id)
+	return result
+
+func calculate_file_hash(file_path: String) -> String:
+	if not FileAccess.file_exists(file_path):
+		push_error("El archivo no existe: %s" % file_path)
+		return ""
+	
+	var ctx = HashingContext.new()
+	ctx.start(HashingContext.HASH_SHA256)
+	
+	var file = FileAccess.open(file_path, FileAccess.READ)
+	if file == null:
+		push_error("No se pudo abrir el archivo: %s" % file_path)
+		return ""
+	
+	while file.get_position() < file.get_length():
+		var remaining = file.get_length() - file.get_position()
+		ctx.update(file.get_buffer(min(remaining, CHUNK_SIZE)))
+	
+	file.close()
+	
+	var res = ctx.finish()
+	return res.hex_encode()
+
+func is_feature_file_valid(feature_id: String) -> bool:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return false
+	
+	if not feature_file_exists(feature_id):
+		push_warning("El archivo del feature '%s' no existe" % feature_id)
+		return false
+	
+	var stored_checksum = features[feature_id].get("checksum", "")
+	
+	if stored_checksum.is_empty():
+		push_warning("El feature '%s' no tiene checksum definido" % feature_id)
+		return false
+	
+	var file_path = features[feature_id].get("path", "")
+	var calculated_checksum = calculate_file_hash(file_path)
+	
+	if calculated_checksum.is_empty():
+		return false
+	
+	return stored_checksum == calculated_checksum
+
+func validate_multiple_features(feature_ids: Array) -> Dictionary:
+	var result = {}
+	for feature_id in feature_ids:
+		result[feature_id] = {
+			"exists": feature_file_exists(feature_id),
+			"valid": is_feature_file_valid(feature_id)
+		}
+	return result
+
+func validate_all_features() -> Dictionary:
+	return validate_multiple_features(get_all_feature_ids())
+
+func update_feature_checksum(feature_id: String) -> bool:
+	if not features.has(feature_id):
+		push_warning("El feature '%s' no existe" % feature_id)
+		return false
+	
+	if not feature_file_exists(feature_id):
+		push_warning("El archivo del feature '%s' no existe" % feature_id)
+		return false
+	
+	var file_path = features[feature_id].get("path", "")
+	var new_checksum = calculate_file_hash(file_path)
+	
+	if new_checksum.is_empty():
+		return false
+	
+	features[feature_id]["checksum"] = new_checksum
+	return save_metadata()
+
+func update_multiple_checksums(feature_ids: Array) -> Dictionary:
+	var result = {}
+	for feature_id in feature_ids:
+		result[feature_id] = update_feature_checksum(feature_id)
+	return result
+
+func update_all_checksums() -> Dictionary:
+	return update_multiple_checksums(get_all_feature_ids())
+
+func get_missing_files() -> Array:
+	var missing = []
+	for feature_id in features.keys():
+		if not feature_file_exists(feature_id):
+			missing.append(feature_id)
+	return missing
+
+func get_invalid_files() -> Array:
+	var invalid = []
+	for feature_id in features.keys():
+		if feature_file_exists(feature_id) and not is_feature_file_valid(feature_id):
+			invalid.append(feature_id)
+	return invalid
+
+func get_files_status_report() -> Dictionary:
+	return {
+		"total": get_feature_count(),
+		"existing": get_all_feature_ids().size() - get_missing_files().size(),
+		"missing": get_missing_files(),
+		"invalid": get_invalid_files(),
+		"valid": get_all_feature_ids().size() - get_missing_files().size() - get_invalid_files().size()
+	}
+
+func check_feature_integrity(feature_id: String) -> Dictionary:
+	var exists = feature_file_exists(feature_id)
+	var valid = false
+	var checksum_current = ""
+	var checksum_stored = ""
+	
+	if exists:
+		valid = is_feature_file_valid(feature_id)
+		var file_path = features[feature_id].get("path", "")
+		checksum_current = calculate_file_hash(file_path)
+		checksum_stored = features[feature_id].get("checksum", "")
+	
+	return {
+		"exists": exists,
+		"valid": valid,
+		"checksum_stored": checksum_stored,
+		"checksum_current": checksum_current,
+		"path": features[feature_id].get("path", "") if features.has(feature_id) else ""
+	}
+
+# ==================== GESTIÓN DE ESTADOS ====================
+func get_feature_state(feature_id: String) -> FeatureState:
+	if not features.has(feature_id):
+		return FeatureState.UNLISTED
+	
+	var feature = features[feature_id]
+	
+	# Runtime states (prioridad)
+	if feature_id in running_features:
+		return FeatureState.RUNNING
+	if loaded_features.has(feature_id):
+		return FeatureState.LOADED
+	
+	var file_exists = feature_file_exists(feature_id)
+	
+	# NOT_DOWNLOADED
+	if not file_exists:
+		if feature.get("download_failed", false):
+			if feature.get("download_timestamp", 0) == 0:
+				return FeatureState.FIRST_DOWNLOAD_FAILED
+			else:
+				return FeatureState.UPDATE_DOWNLOAD_FAILED
+		return FeatureState.NOT_DOWNLOADED
+	
+	# Validation states
+	if not is_feature_file_valid(feature_id):
+		return FeatureState.INVALID
+	
+	if not can_load_feature(feature_id):
+		return FeatureState.CORRUPTED
+	
+	return FeatureState.STABLE
+
+func get_feature_states(feature_id: String) -> Dictionary:
+	return {
+		"primary": get_feature_state(feature_id),
+		"existence": _get_existence_state(feature_id),
+		"download": _get_download_state(feature_id),
+		"check": _get_check_state(feature_id),
+		"validation": _get_validation_state(feature_id),
+		"runtime": _get_runtime_state(feature_id),
+		"cleanup": _get_cleanup_state(feature_id)
+	}
+
+func _get_existence_state(feature_id: String) -> FeatureState:
+	return FeatureState.LISTED if features.has(feature_id) else FeatureState.UNLISTED
+
+func _get_download_state(feature_id: String) -> FeatureState:
+	if not features.has(feature_id):
+		return FeatureState.UNLISTED
+	
+	if not feature_file_exists(feature_id):
+		var feature = features[feature_id]
+		if feature.get("download_failed", false):
+			if feature.get("download_timestamp", 0) == 0:
+				return FeatureState.FIRST_DOWNLOAD_FAILED
+			return FeatureState.UPDATE_DOWNLOAD_FAILED
+		return FeatureState.NOT_DOWNLOADED
+	
+	return FeatureState.DOWNLOADED
+
+func _get_check_state(feature_id: String) -> FeatureState:
+	if not features.has(feature_id):
+		return FeatureState.UNLISTED
+	
+	var feature = features[feature_id]
+	
+	if feature.get("check_failed", false):
+		return FeatureState.CHECK_FAILED
+	
+	if not feature.has("remote_version"):
+		return FeatureState.VERSION_UNKNOWN
+	
+	if not feature_file_exists(feature_id):
+		return FeatureState.VERSION_UNKNOWN
+	
+	var local_version = feature.get("version", 0)
+	var remote_version = feature.get("remote_version", 0)
+	
+	if local_version == remote_version:
+		return FeatureState.UP_TO_DATE if feature.get("last_check", 0) > 0 else FeatureState.UP_TO_DATE_UNFETCHED
+	elif local_version < remote_version:
+		return FeatureState.OUTDATED
+	
+	return FeatureState.UP_TO_DATE_UNFETCHED
+
+func _get_validation_state(feature_id: String) -> FeatureState:
+	if not features.has(feature_id):
+		return FeatureState.UNLISTED
+	
+	if not feature_file_exists(feature_id):
+		return FeatureState.NOT_DOWNLOADED
+	
+	if not is_feature_file_valid(feature_id):
+		return FeatureState.INVALID
+	
+	if not can_load_feature(feature_id):
+		return FeatureState.CORRUPTED
+	
+	return FeatureState.STABLE
+
+func _get_runtime_state(feature_id: String) -> FeatureState:
+	if feature_id in running_features:
+		return FeatureState.RUNNING
+	if loaded_features.has(feature_id):
+		return FeatureState.LOADED
+	return FeatureState.UNLOADED
+
+func _get_cleanup_state(feature_id: String) -> FeatureState:
+	if not features.has(feature_id):
+		return FeatureState.UNLISTED
+	
+	var feature = features[feature_id]
+	var current_time = Time.get_unix_time_from_system()
+	
+	var last_used = feature.get("last_used", 0)
+	var download_timestamp = feature.get("download_timestamp", 0)
+	
+	if last_used == download_timestamp and last_used > 0:
+		return FeatureState.NEVER_USED
+	
+	if last_used > 0 and (current_time - last_used) > USAGE_STALE_THRESHOLD:
+		return FeatureState.USAGE_STALE
+	
+	if download_timestamp > 0 and (current_time - download_timestamp) > DOWNLOAD_STALE_THRESHOLD:
+		return FeatureState.DOWNLOAD_STALE
+	
+	return FeatureState.SAFE
+
+# ==================== CARGA DE RECURSOS ====================
+func can_load_feature(feature_id: String) -> bool:
+	if not features.has(feature_id):
+		return false
+	
+	if not feature_file_exists(feature_id):
+		return false
+	
+	var path = features[feature_id].get("path", "")
+	return ResourceLoader.exists(path)
+
+func load_feature(feature_id: String, use_sub_threads: bool = true) -> bool:
+	if not features.has(feature_id):
+		push_error("Feature '%s' no existe" % feature_id)
+		return false
+	
+	if not feature_file_exists(feature_id):
+		push_error("Archivo del feature '%s' no existe" % feature_id)
+		return false
+	
+	if loaded_features.has(feature_id):
+		push_warning("Feature '%s' ya está cargado" % feature_id)
+		return true
+	
+	var path = features[feature_id].get("path", "")
+	update_last_used(feature_id)
+	
+	var error = ResourceLoader.load_threaded_request(path, "", use_sub_threads)
+	
+	if error != OK:
+		push_error("Error al iniciar carga del feature '%s': %s" % [feature_id, error])
+		return false
+	
+	return true
+
+func get_load_progress(feature_id: String) -> Dictionary:
+	if not features.has(feature_id):
+		return {"status": ResourceLoader.THREAD_LOAD_INVALID_RESOURCE, "progress": 0.0}
+	
+	var path = features[feature_id].get("path", "")
+	var progress = []
+	var status = ResourceLoader.load_threaded_get_status(path, progress)
+	
+	return {
+		"status": status,
+		"progress": progress[0] if progress.size() > 0 else 0.0,
+		"status_text": _get_status_text(status)
+	}
+
+func _get_status_text(status: int) -> String:
+	match status:
+		ResourceLoader.THREAD_LOAD_INVALID_RESOURCE:
+			return "INVALID_RESOURCE"
+		ResourceLoader.THREAD_LOAD_IN_PROGRESS:
+			return "IN_PROGRESS"
+		ResourceLoader.THREAD_LOAD_FAILED:
+			return "FAILED"
+		ResourceLoader.THREAD_LOAD_LOADED:
+			return "LOADED"
+		_:
+			return "UNKNOWN"
+
+func complete_load(feature_id: String) -> Resource:
+	if not features.has(feature_id):
+		push_error("Feature '%s' no existe" % feature_id)
+		return null
+	
+	var path = features[feature_id].get("path", "")
+	var progress = get_load_progress(feature_id)
+	
+	if progress.status != ResourceLoader.THREAD_LOAD_LOADED:
+		push_error("Feature '%s' no ha terminado de cargar. Estado: %s" % [feature_id, progress.status_text])
+		return null
+	
+	var resource = ResourceLoader.load_threaded_get(path)
+	
+	if resource == null:
+		push_error("Error al obtener recurso del feature '%s'" % feature_id)
+		return null
+	
+	loaded_features[feature_id] = resource
+	update_last_used(feature_id)
+	
+	return resource
+
+func load_feature_sync(feature_id: String) -> Resource:
+	if not features.has(feature_id):
+		push_error("Feature '%s' no existe" % feature_id)
+		return null
+	
+	if loaded_features.has(feature_id):
+		return loaded_features[feature_id]
+	
+	if not feature_file_exists(feature_id):
+		push_error("Archivo del feature '%s' no existe" % feature_id)
+		return null
+	
+	var path = features[feature_id].get("path", "")
+	var resource = ResourceLoader.load(path)
+	
+	if resource == null:
+		push_error("Error al cargar feature '%s'" % feature_id)
+		return null
+	
+	loaded_features[feature_id] = resource
+	update_last_used(feature_id)
+	
+	return resource
+
+func unload_feature(feature_id: String) -> bool:
+	if not loaded_features.has(feature_id):
+		push_warning("Feature '%s' no está cargado" % feature_id)
+		return false
+	
+	if feature_id in running_features:
+		push_error("No se puede descargar feature '%s' porque está en ejecución" % feature_id)
+		return false
+	
+	loaded_features.erase(feature_id)
+	return true
+
+func unload_all_features(force: bool = false) -> Array:
+	var unloaded = []
+	
+	for feature_id in loaded_features.keys():
+		if force or feature_id not in running_features:
+			if force and feature_id in running_features:
+				running_features.erase(feature_id)
+			loaded_features.erase(feature_id)
+			unloaded.append(feature_id)
+	
+	return unloaded
+
+func get_loaded_feature(feature_id: String) -> Resource:
+	return loaded_features.get(feature_id, null)
+
+func is_feature_loaded(feature_id: String) -> bool:
+	return loaded_features.has(feature_id)
+
+# ==================== GESTIÓN DE EJECUCIÓN ====================
+func set_feature_running(feature_id: String) -> bool:
+	if not is_feature_loaded(feature_id):
+		push_error("Feature '%s' no está cargado" % feature_id)
+		return false
+	
+	if feature_id not in running_features:
+		running_features.append(feature_id)
+		update_last_used(feature_id)
+	
+	return true
+
+func set_feature_stopped(feature_id: String) -> bool:
+	if feature_id in running_features:
+		running_features.erase(feature_id)
+		return true
+	return false
+
+func get_running_features() -> Array:
+	return running_features.duplicate()
+
+# ==================== LIMPIEZA ====================
+func get_stale_features() -> Dictionary:
+	var current_time = Time.get_unix_time_from_system()
+	var result = {
+		"usage_stale": [],
+		"download_stale": [],
+		"never_used": []
+	}
+	
+	for feature_id in features.keys():
+		var feature = features[feature_id]
+		var last_used = feature.get("last_used", 0)
+		var download_timestamp = feature.get("download_timestamp", 0)
+		
+		if feature_id in running_features or loaded_features.has(feature_id):
+			continue
+		
+		if last_used == download_timestamp and last_used > 0:
+			result.never_used.append(feature_id)
+			continue
+		
+		if last_used > 0 and (current_time - last_used) > USAGE_STALE_THRESHOLD:
+			result.usage_stale.append(feature_id)
+		
+		if download_timestamp > 0 and (current_time - download_timestamp) > DOWNLOAD_STALE_THRESHOLD:
+			result.download_stale.append(feature_id)
+	
+	return result
+
+func cleanup_stale_features(cleanup_never_used: bool = false) -> Dictionary:
+	var stale = get_stale_features()
+	var result = {
+		"deleted_files": [],
+		"deleted_metadata": [],
+		"failed": []
+	}
+	
+	var to_cleanup = []
+	to_cleanup.append_array(stale.usage_stale)
+	to_cleanup.append_array(stale.download_stale)
+	
+	if cleanup_never_used:
+		to_cleanup.append_array(stale.never_used)
+	
+	for feature_id in to_cleanup:
+		var file_path = features[feature_id].get("path", "")
+		
+		if feature_file_exists(feature_id):
+			var dir = DirAccess.open(file_path.get_base_dir())
+			if dir != null:
+				var err = dir.remove(file_path.get_file())
+				if err == OK:
+					result.deleted_files.append(feature_id)
+				else:
+					result.failed.append(feature_id)
+					continue
+		
+		if delete_feature(feature_id):
+			result.deleted_metadata.append(feature_id)
+		else:
+			result.failed.append(feature_id)
+	
+	return result
+
+func delete_feature_file(feature_id: String) -> bool:
+	if not features.has(feature_id):
+		push_warning("Feature '%s' no existe" % feature_id)
+		return false
+	
+	if is_feature_loaded(feature_id) or feature_id in running_features:
+		push_error("No se puede eliminar archivo del feature '%s' porque está en uso" % feature_id)
+		return false
+	
+	if not feature_file_exists(feature_id):
+		push_warning("El archivo del feature '%s' no existe" % feature_id)
+		return true
+	
+	var file_path = features[feature_id].get("path", "")
+	var dir = DirAccess.open(file_path.get_base_dir())
+	
+	if dir == null:
+		push_error("No se pudo acceder al directorio del feature '%s'" % feature_id)
+		return false
+	
+	var err = dir.remove(file_path.get_file())
+	return err == OK
+
+func get_cleanup_stats() -> Dictionary:
+	var stale = get_stale_features()
+	var total_stale = stale.usage_stale.size() + stale.download_stale.size()
+	
+	var total_size = 0
+	for feature_id in (stale.usage_stale + stale.download_stale):
+		if feature_file_exists(feature_id):
+			var path = features[feature_id].get("path", "")
+			var file = FileAccess.open(path, FileAccess.READ)
+			if file != null:
+				total_size += file.get_length()
+				file.close()
+	
+	return {
+		"usage_stale_count": stale.usage_stale.size(),
+		"download_stale_count": stale.download_stale.size(),
+		"never_used_count": stale.never_used.size(),
+		"total_stale": total_stale,
+		"estimated_size_bytes": total_size,
+		"estimated_size_mb": total_size / 1024.0 / 1024.0
+	}
+
+# ==================== VERIFICACIÓN DE VERSIONES ====================
+func check_remote_version(feature_id: String, callback: Callable = Callable()) -> void:
+	if not features.has(feature_id):
+		push_error("Feature '%s' no existe" % feature_id)
+		if callback.is_valid():
+			callback.call(false, 0, "Feature no existe")
+		return
+	
+	var feature = features[feature_id]
+	var version_url = feature.get("version_url", "")
+	
+	if version_url.is_empty():
+		push_error("Feature '%s' no tiene version_url" % feature_id)
+		features[feature_id]["check_failed"] = true
+		save_metadata()
+		if callback.is_valid():
+			callback.call(false, 0, "No hay URL de versión")
+		return
+	
+	Request.download_text(version_url, [], func(success: bool, data, error: String):
+		if not success:
+			push_error("Error al verificar versión de '%s': %s" % [feature_id, error])
+			features[feature_id]["check_failed"] = true
+			features[feature_id]["last_check"] = Time.get_unix_time_from_system()
+			save_metadata()
+			if callback.is_valid():
+				callback.call(false, 0, error)
+			return
+		
+		var remote_version = 0
+		if data is Dictionary and data.has("version"):
+			remote_version = int(data.get("version", 0))
+		elif data is String:
+			remote_version = int(data.strip_edges())
+		else:
+			remote_version = int(str(data).strip_edges())
+		
+		features[feature_id]["remote_version"] = remote_version
+		features[feature_id]["check_failed"] = false
+		features[feature_id]["last_check"] = Time.get_unix_time_from_system()
+		save_metadata()
+		
+		print("✅ Versión remota de '%s': %d" % [feature_id, remote_version])
+		
+		if callback.is_valid():
+			callback.call(true, remote_version, "")
+	)
+
+func check_multiple_versions(feature_ids: Array, callback: Callable = Callable()) -> void:
+	var results = {}
+	var pending = feature_ids.size()
+	
+	if pending == 0:
+		if callback.is_valid():
+			callback.call(results)
+		return
+	
+	for feature_id in feature_ids:
+		check_remote_version(feature_id, func(success: bool, version: int, error: String):
+			results[feature_id] = {
+				"success": success,
+				"version": version,
+				"error": error
+			}
+			pending -= 1
+			
+			if pending == 0 and callback.is_valid():
+				callback.call(results)
+		)
+
+func check_all_versions(callback: Callable = Callable()) -> void:
+	check_multiple_versions(get_all_feature_ids(), callback)
+
+func compare_versions(feature_id: String) -> Dictionary:
+	if not features.has(feature_id):
+		return {"status": "not_found", "needs_update": false}
+	
+	var feature = features[feature_id]
+	var local_version = feature.get("version", 0)
+	var remote_version = feature.get("remote_version", -1)
+	
+	if remote_version == -1:
+		return {"status": "unknown", "needs_update": false, "local": local_version}
+	
+	if local_version < remote_version:
+		return {"status": "outdated", "needs_update": true, "local": local_version, "remote": remote_version}
+	elif local_version == remote_version:
+		return {"status": "up_to_date", "needs_update": false, "local": local_version, "remote": remote_version}
+	else:
+		return {"status": "ahead", "needs_update": false, "local": local_version, "remote": remote_version}
+
+func get_outdated_features() -> Array:
+	var outdated = []
+	for feature_id in features.keys():
+		var comparison = compare_versions(feature_id)
+		if comparison.get("needs_update", false):
+			outdated.append(feature_id)
+	return outdated
+
+# ==================== DESCARGA DE FEATURES ====================
+func download_feature(feature_id: String, progress_callback: Callable = Callable(), 
+					  complete_callback: Callable = Callable()) -> void:
+	if not features.has(feature_id):
+		push_error("Feature '%s' no existe" % feature_id)
+		if complete_callback.is_valid():
+			complete_callback.call(false, "Feature no existe")
+		return
+	
+	if _downloading_features.has(feature_id):
+		push_warning("Feature '%s' ya se está descargando" % feature_id)
+		return
+	
+	var feature = features[feature_id]
+	var download_url = feature.get("donwload_url", "")
+	var save_path = feature.get("path", "")
+	
+	if download_url.is_empty():
+		push_error("Feature '%s' no tiene download_url" % feature_id)
+		features[feature_id]["download_failed"] = true
+		save_metadata()
+		if complete_callback.is_valid():
+			complete_callback.call(false, "No hay URL de descarga")
+		return
+	
+	if save_path.is_empty():
+		push_error("Feature '%s' no tiene path" % feature_id)
+		if complete_callback.is_valid():
+			complete_callback.call(false, "No hay ruta de guardado")
+		return
+	
+	var dir_path = save_path.get_base_dir()
+	if not DirAccess.dir_exists_absolute(dir_path):
+		DirAccess.make_dir_recursive_absolute(dir_path)
+	
+	_downloading_features[feature_id] = {
+		"progress": 0.0,
+		"progress_callback": progress_callback,
+		"started_at": Time.get_unix_time_from_system()
+	}
+	
+	print("⬇️ Descargando '%s' desde: %s" % [feature_id, download_url])
+	
+	Request.download_file(
+		download_url,
+		save_path,
+		[],
+		func(downloaded: int, total: int, progress: float):
+			if _downloading_features.has(feature_id):
+				_downloading_features[feature_id]["progress"] = progress
+				if progress_callback.is_valid():
+					progress_callback.call(feature_id, downloaded, total, progress),
+		func(success: bool, file_path: String, error: String):
+			_downloading_features.erase(feature_id)
+			
+			if success:
+				var checksum = calculate_file_hash(file_path)
+				
+				features[feature_id]["download_timestamp"] = Time.get_unix_time_from_system()
+				features[feature_id]["checksum"] = checksum
+				features[feature_id]["download_failed"] = false
+				
+				if features[feature_id].get("last_used", 0) == 0:
+					features[feature_id]["last_used"] = features[feature_id]["download_timestamp"]
+				
+				if features[feature_id].has("remote_version"):
+					features[feature_id]["version"] = features[feature_id]["remote_version"]
+				
+				save_metadata()
+				
+				print("✅ Feature '%s' descargado correctamente" % feature_id)
+				print("   Checksum: %s" % checksum)
+			else:
+				push_error("Error al descargar '%s': %s" % [feature_id, error])
+				features[feature_id]["download_failed"] = true
+				save_metadata()
+			
+			if complete_callback.is_valid():
+				complete_callback.call(success, error)
+	)
+
+func download_multiple_features(feature_ids: Array, progress_callback: Callable = Callable(),
+								complete_callback: Callable = Callable()) -> void:
+	var results = {}
+	var pending = feature_ids.size()
+	
+	if pending == 0:
+		if complete_callback.is_valid():
+			complete_callback.call(results)
+		return
+	
+	for feature_id in feature_ids:
+		download_feature(
+			feature_id,
+			progress_callback,
+			func(success: bool, error: String):
+				results[feature_id] = {"success": success, "error": error}
+				pending -= 1
+				
+				if pending == 0 and complete_callback.is_valid():
+					complete_callback.call(results)
+		)
+
+func get_download_progress(feature_id: String) -> float:
+	if _downloading_features.has(feature_id):
+		return _downloading_features[feature_id].get("progress", 0.0)
+	return -1.0
+
+func is_downloading(feature_id: String) -> bool:
+	return _downloading_features.has(feature_id)
+
+func get_active_downloads() -> Array:
+	return _downloading_features.keys()
+
+# ==================== ACTUALIZACIÓN DE FEATURES ====================
+func update_package(feature_id: String, force: bool = false, 
+				   progress_callback: Callable = Callable(),
+				   complete_callback: Callable = Callable()) -> void:
+	if not features.has(feature_id):
+		push_error("Feature '%s' no existe" % feature_id)
+		if complete_callback.is_valid():
+			complete_callback.call(false, "Feature no existe")
+		return
+	
+	if is_feature_loaded(feature_id) or feature_id in running_features:
+		push_error("No se puede actualizar '%s' porque está en uso" % feature_id)
+		if complete_callback.is_valid():
+			complete_callback.call(false, "Feature en uso")
+		return
+	
+	check_remote_version(feature_id, func(success: bool, remote_version: int, error: String):
+		if not success:
+			push_error("Error al verificar versión de '%s': %s" % [feature_id, error])
+			if complete_callback.is_valid():
+				complete_callback.call(false, "Error verificando versión: " + error)
+			return
+		
+		var comparison = compare_versions(feature_id)
+		
+		if not force and comparison.get("status") == "up_to_date":
+			print("ℹ️ Feature '%s' ya está actualizado (v%d)" % [feature_id, remote_version])
+			if complete_callback.is_valid():
+				complete_callback.call(true, "Ya está actualizado")
+			return
+		
+		if feature_file_exists(feature_id):
+			delete_feature_file(feature_id)
+		
+		print("🔄 Actualizando '%s' de v%d a v%d" % [
+			feature_id, 
+			comparison.get("local", 0), 
+			comparison.get("remote", 0)
+		])
+		
+		download_feature(feature_id, progress_callback, complete_callback)
+	)
+
+func update_multiple_features(feature_ids: Array, force: bool = false,
+							 progress_callback: Callable = Callable(),
+							 complete_callback: Callable = Callable()) -> void:
+	var results = {}
+	var pending = feature_ids.size()
+	
+	if pending == 0:
+		if complete_callback.is_valid():
+			complete_callback.call(results)
+		return
+	
+	for feature_id in feature_ids:
+		update_package(
+			feature_id,
+			force,
+			progress_callback,
+			func(success: bool, error: String):
+				results[feature_id] = {"success": success, "error": error}
+				pending -= 1
+				
+				if pending == 0 and complete_callback.is_valid():
+					complete_callback.call(results)
+		)
+
+func update_all_outdated(progress_callback: Callable = Callable(),
+						complete_callback: Callable = Callable()) -> void:
+	check_all_versions(func(results):
+		var outdated = get_outdated_features()
+		
+		if outdated.is_empty():
+			print("✅ Todos los features están actualizados")
+			if complete_callback.is_valid():
+				complete_callback.call({})
+			return
+		
+		print("🔄 Actualizando %d features..." % outdated.size())
+		update_multiple_features(outdated, false, progress_callback, complete_callback)
+	)
+
+func validate_and_repair(feature_id: String, progress_callback: Callable = Callable(),
+						complete_callback: Callable = Callable()) -> void:
+	if not features.has(feature_id):
+		push_error("Feature '%s' no existe" % feature_id)
+		if complete_callback.is_valid():
+			complete_callback.call(false, "Feature no existe")
+		return
+	
+	if not feature_file_exists(feature_id):
+		print("⚠️ Feature '%s' no tiene archivo, descargando..." % feature_id)
+		download_feature(feature_id, progress_callback, complete_callback)
+		return
+	
+	if not is_feature_file_valid(feature_id):
+		print("⚠️ Feature '%s' tiene checksum inválido, redescargando..." % feature_id)
+		delete_feature_file(feature_id)
+		download_feature(feature_id, progress_callback, complete_callback)
+		return
+	
+	if not can_load_feature(feature_id):
+		print("⚠️ Feature '%s' está corrupto, redescargando..." % feature_id)
+		delete_feature_file(feature_id)
+		download_feature(feature_id, progress_callback, complete_callback)
+		return
+	
+	print("✅ Feature '%s' está en buen estado" % feature_id)
+	if complete_callback.is_valid():
+		complete_callback.call(true, "Feature válido")
